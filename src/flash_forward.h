@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <curand_kernel.h>
 #include <cstdint>
 #include "utils.h"
 #include "flash.h"
@@ -44,6 +45,12 @@ void forward_kernel(mykernelParamType param){
 
     if (Is_causal){
         n_block_max = min(n_block_max, ((bx + 1) * param.Br + param.Bc - 1) / param.Bc);
+    }
+
+    curandStatePhilox4_32_10_t local_state;
+    if (Is_dropout) {
+        const int state_idx = blockIdx.z * gridDim.y * gridDim.x + blockIdx.y * gridDim.x + blockIdx.x;
+        local_state = param.states[state_idx];
     }
 
     // 计算K,V的全局内存地址
@@ -169,7 +176,7 @@ void forward_kernel(mykernelParamType param){
                 c_frag[i][j]     *= param.softmax_scale;
                 c_frag[i][j + 4] *= param.softmax_scale;
 
-                if(Has_alibi){
+                if (Has_alibi){
                     int row = bx * param.Br + warp_id * 16 + lane_id / 4;
                     int col = iter * param.Bc + i * 16 + (lane_id % 4) * 2 + j / 2 * 8 + j % 2;
                     c_frag[i][j]     -= alibi_slope * abs(row - col);
@@ -219,6 +226,24 @@ void forward_kernel(mykernelParamType param){
         float row_m_new2 = fmaxf(row_m2, row_m_prev2);
         float row_l_new1 = (__expf(row_m_prev1 - row_m_new1) * row_l_prev1) + (__expf(row_m1 - row_m_new1) * row_l1);
         float row_l_new2 = (__expf(row_m_prev2 - row_m_new2) * row_l_prev2) + (__expf(row_m2 - row_m_new2) * row_l2);
+
+        if (Is_dropout) {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    // 生成随机数
+                    float rand_val = curand_uniform(&local_state);
+                    
+                    // 应用mask
+                    if (rand_val < param.dropout_prob) {
+                        c_frag[i][j] = 0.0f;
+                    } else {
+                        c_frag[i][j] *= 1.0f / (1.0f - param.dropout_prob);
+                    }
+                }
+            }
+        }
 
         // 打包数据,为了使用tensor core
         #pragma unroll
@@ -286,6 +311,13 @@ void forward_kernel(mykernelParamType param){
     #pragma unroll
     for (int k = 0; k < load_QO_num / 4; k++){
         LDST128BITS(O[qo_offset_tx+k*4]) = LDST128BITS(Oj[qo_offset_tx+k*4]);
+    }
+
+    if (Is_dropout) {
+        const int state_idx = blockIdx.z * gridDim.y * gridDim.x + 
+                            blockIdx.y * gridDim.x + 
+                            blockIdx.x;
+        param.states[state_idx] = local_state;
     }
 }
 #endif

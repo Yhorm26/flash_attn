@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <sys/time.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 #include <cuda_runtime.h>
 #include "utils.h"
 #include "flash.h"
+#include "init_curand_states.h"
 #include "flash_forward.h"
 
 
@@ -43,7 +45,7 @@ void verfiy(
         {
             printf("error, postion:%d, gpuvalue:%f, cpuvalue:%f\n", i, O_host[i], O[i]);
             error++;
-            // break;
+            break;
         }        
     }
     printf("==================finish,error:%d==================\n",error);
@@ -168,11 +170,17 @@ int main(){
     const int  seq_len          = 1024;
     const int  head_dim         = 32;
 
-    const bool dropout          = false;    
-    const bool causal_mask      = true;     // 一般来说， causal_mask不会和window_attention同时启用 
+    const bool dropout          = true;      // 一旦启用dropout,那核函数的结果和没有使用dropout的cpu端结果必然不同,因此便不再验证结果正确性
+    const bool causal_mask      = false;     // 一般来说， causal_mask不会和window_attention同时启用 
     const bool window_attention = false;
-    const bool alibi            = true;
+    const bool alibi            = false;
     const bool high_precision   = false;    
+
+    float dropout_prob = 0.0f;
+    curandStatePhilox4_32_10_t* d_states;
+    if(dropout){
+        dropout_prob = 0.1f;
+    }
 
     int window_size = -1;
     if(window_attention){
@@ -253,6 +261,19 @@ int main(){
     param.window_size_left  = window_size;
     param.alibi_slopes_ptr  = alibi_slopes_device;
 
+    if(dropout){
+        // 分配状态内存
+        int num_blocks = param.Tr * n_heads * batch_size * 256;
+        cudaMalloc(&d_states, num_blocks * sizeof(curandStatePhilox4_32_10_t));
+
+        // 初始化状态
+        dim3 grid((num_blocks + 255)/256, 1, 1);
+        int seed = 48;
+        init_curand_states<<<grid, 256>>>(d_states, seed, num_blocks);
+        param.dropout_prob      = dropout_prob;
+        param.states            = d_states;
+    }
+
     // CPU端计算正确结果
     attention_forward_cpu(Q, K, V, param.softmax_scale, batch_size, n_heads, seq_len, head_dim, O, causal_mask, window_size, alibi_slopes);
 
@@ -281,10 +302,11 @@ int main(){
     // 将GPU结果拷贝回主机端
     cudaMemcpy(O_host, O_device, batch_size*n_heads*seq_len*head_dim*sizeof(float), cudaMemcpyDeviceToHost);
     printf("kernel time: %f us\n", time_elapsed*1000);
-    printf("Verify the result of kernel function\n");
     // 检验结果正确性
-    verfiy(O, O_host, batch_size, n_heads, seq_len, head_dim, 0.05);
-
+    if(!dropout){
+        printf("Verify the result of kernel function\n");
+        verfiy(O, O_host, batch_size, n_heads, seq_len, head_dim, 0.05);
+    }
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
@@ -296,6 +318,7 @@ int main(){
     cudaFree(Q_device_half);
     cudaFree(K_device_half);
     cudaFree(V_device_half);
+    cudaFree(d_states);
     
     // 释放内存
     free(Q);
