@@ -24,6 +24,9 @@ typedef struct mykernelParamType
     half*    K;
     half*    V;
     float*   O;
+    float*   O_tmp;  // splitkv中O的临时空间
+    float*   L;      // splitkv中各个分段每行的和
+    float*   M;      // splitkv中各个分段每行的最大值
     int      N;
     int      d;
     int      Br;
@@ -37,6 +40,7 @@ typedef struct mykernelParamType
     int      window_size_left;
     int      window_size_right;
     float*   alibi_slopes_ptr;
+    int      split_num;
 }mykernelParamType;
 
 
