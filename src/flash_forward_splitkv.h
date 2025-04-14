@@ -1,5 +1,5 @@
-#ifndef FLASH_FORWARD_H
-#define FLASH_FORWARD_H
+#ifndef FLASH_FORWARD_SPLITKV_H
+#define FLASH_FORWARD_SPLITKV_H
 #include <stdio.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -7,12 +7,13 @@
 #include <curand_kernel.h>
 #include <cstdint>
 #include "utils.h"
+# include <cmath>
 
 using namespace nvcuda;
 
 template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi>
 __global__
-void forward_kernel(mykernelParamType param){
+void forward_kernel_splitkv(mykernelParamType param){
     const int tx = threadIdx.x;
     const int warp_id = tx / 32; const int lane_id = tx % 32;
     const int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
@@ -35,15 +36,18 @@ void forward_kernel(mykernelParamType param){
     float    c_frag[8][8];
     uint32_t d_frag[8][4];
 
-    const int n_block_min = !Is_local? 0 : max(0, ((bx * param.Br - param.window_size_left) / param.Bc));
-    int n_block_max = (param.N + param.Bc - 1) / param.Bc;
+    int total_kv_blocks = (param.N + param.Bc - 1) / param.Bc; // 总K/V块数
+    int blocks_per_split = (total_kv_blocks + param.split_num - 1) / param.split_num;
+    int n_block_min = blocks_per_split * (bx % param.split_num);
+    int n_block_max = min(n_block_min + blocks_per_split, total_kv_blocks);
+    n_block_min = !Is_local? n_block_min : max(n_block_min, (((bx / param.split_num) * param.Br - param.window_size_left) / param.Bc));
 
     if (Is_local){
-        n_block_max = min(n_block_max, ((bx + 1) * param.Br + param.window_size_right + param.Bc - 1) / param.Bc);
+        n_block_max = min(n_block_max, (((bx / param.split_num) + 1) * param.Br + param.window_size_right + param.Bc - 1) / param.Bc);
     }
 
     if (Is_causal){
-        n_block_max = min(n_block_max, ((bx + 1) * param.Br + param.Bc - 1) / param.Bc);
+        n_block_max = min(n_block_max, (((bx / param.split_num) + 1) * param.Br + param.Bc - 1) / param.Bc);
     }
 
     curandStatePhilox4_32_10_t local_state;
@@ -53,16 +57,18 @@ void forward_kernel(mykernelParamType param){
     }
 
     // 计算K,V的全局内存地址
-    int kv_offset = (bz * gridDim.y * param.N * param.d) + (by * param.N * param.d) + param.d * param.Bc * n_block_min;
+    int kv_offset = (bz * gridDim.y + by)* param.N * param.d + param.d * param.Bc * n_block_min;
     // // 计算Q的全局内存地址
-    int qo_offset  = (bz * gridDim.y * param.N * param.d) + (by * param.N * param.d) + param.d * param.Br * bx;
+    int q_offset = (bz * gridDim.y + by)* param.N * param.d + param.d * param.Br * (bx / param.split_num);
+    int o_offset = (bz * gridDim.y + by)* param.N * param.d * param.split_num + param.d * param.Br * bx;
 
-    half*  Q = param.Q + qo_offset;
+    half*  Q = param.Q + q_offset;
     half*  K = param.K + kv_offset;
     half*  V = param.V + kv_offset;
-    float* O = param.O + qo_offset;
+    float* O = param.O_tmp + o_offset;
 
     // 初始化结果
+    #pragma unroll
     for (int i = tx; i < param.Br * param.d; i += blockDim.x) {
         Oj[i] = 0.0f;
     }
@@ -74,20 +80,22 @@ void forward_kernel(mykernelParamType param){
     size_t qo_offset_tx = tx * load_QO_num;    // 每个线程搬运数据相对的起始地址
     size_t kv_offset_tx = tx * load_KV_num;
 
-    // 把Q从全局内存加载到共享内存
-    #pragma unroll
-    for (int k = 0; k < load_QO_num / 8; k++){
-        CP_ASYNC_CG(__cvta_generic_to_shared(&Qj[qo_offset_tx+k*8]), &Q[qo_offset_tx+k*8], 16);
+    if (n_block_min < n_block_max){
+        // 把Q从全局内存加载到共享内存
+        #pragma unroll
+        for (int k = 0; k < load_QO_num / 8; k++){
+            CP_ASYNC_CG(__cvta_generic_to_shared(&Qj[qo_offset_tx+k*8]), &Q[qo_offset_tx+k*8], 16);
+        }
+    
+        // 把K的第一块从全局内存加载到共享内存
+        #pragma unroll
+        for (int k = 0; k < load_KV_num / 8; k++){
+            CP_ASYNC_CG(__cvta_generic_to_shared(&Kj[kv_offset_tx+k*8]), &K[kv_offset_tx+k*8], 16);
+        }
+
+        CP_ASYNC_COMMIT_GROUP();
     }
     
-    // 把K的第一块从全局内存加载到共享内存
-    #pragma unroll
-    for (int k = 0; k < load_KV_num / 8; k++){
-        CP_ASYNC_CG(__cvta_generic_to_shared(&Kj[kv_offset_tx+k*8]), &K[kv_offset_tx+k*8], 16);
-    }
-
-    CP_ASYNC_COMMIT_GROUP();
-
     for (int iter = n_block_min; iter < n_block_max; iter++){
         // 确保Q,K均加载到共享内存
         CP_ASYNC_WAIT_ALL();
@@ -120,7 +128,7 @@ void forward_kernel(mykernelParamType param){
         }
 
         // causal mask 处理
-        if (Is_causal && iter == bx){
+        if (Is_causal && iter == bx / param.split_num){
             #pragma unroll
             for(int i = warp_id + 1; i < 8; i++){
                 #pragma unroll
@@ -140,11 +148,11 @@ void forward_kernel(mykernelParamType param){
         }
 
         // window attention处理
-        if (Is_local && ((bx + 1) * param.Br - 1 - ((iter - 1) * param.Bc + 1) > param.window_size_left || \
-                         (iter + 1) * param.Bc - 1 - ((bx - 1) * param.Br + 1) > param.window_size_right)){
+        if (Is_local && ((bx / param.split_num + 1) * param.Br - 1 - ((iter - 1) * param.Bc + 1) > param.window_size_left || \
+                         (iter + 1) * param.Bc - 1 - ((bx / param.split_num - 1) * param.Br + 1) > param.window_size_right)){
             for (int i = 0; i < 8; i++) {
                 for (int j = 0; j < 8; j++){
-                    int row = bx * param.Br + warp_id * 16 + lane_id / 4 + (j / 4) * 8;
+                    int row = (bx / param.split_num) * param.Br + warp_id * 16 + lane_id / 4 + (j / 4) * 8;
                     int col = iter * param.Bc + i * 16 + (lane_id % 4) * 2 + (j % 4) / 2 * 8 + j % 2;
                     if(row - col > param.window_size_left || col - row > param.window_size_right){
                         c_frag[i][j] = -INFINITY;
@@ -176,7 +184,7 @@ void forward_kernel(mykernelParamType param){
                 c_frag[i][j + 4] *= param.softmax_scale;
 
                 if (Has_alibi){
-                    int row = bx * param.Br + warp_id * 16 + lane_id / 4;
+                    int row = (bx / param.split_num) * param.Br + warp_id * 16 + lane_id / 4;
                     int col = iter * param.Bc + i * 16 + (lane_id % 4) * 2 + j / 2 * 8 + j % 2;
                     c_frag[i][j]     -= alibi_slope * abs(row - col);
                     c_frag[i][j + 4] -= alibi_slope * abs(row + 8 - col);
@@ -186,6 +194,8 @@ void forward_kernel(mykernelParamType param){
                 if (c_frag[i][j + 4] > row_m2)    row_m2 = c_frag[i][j + 4];
             }
         }
+
+        __syncthreads();
 
         // 规约出最大值
         #pragma unroll
@@ -210,6 +220,8 @@ void forward_kernel(mykernelParamType param){
             }
         }
 
+         __syncthreads();
+
         // 规约求和
         #pragma unroll
         for (int i = 3; i >= 1; i /= 2){
@@ -219,6 +231,9 @@ void forward_kernel(mykernelParamType param){
             row_l_other = __shfl_xor_sync(0xffffffff, row_l2, i, 32);
             row_l2 += row_l_other;
         }
+
+         __syncthreads();
+
 
         // 计算最大值与和
         float row_m_new1 = fmaxf(row_m1, row_m_prev1);
@@ -254,11 +269,11 @@ void forward_kernel(mykernelParamType param){
         }
 
         // 计算O需要的系数
-        float factor1 = 1 / row_l_new1;
+        float factor1 = (row_l_new1 != 0.0f) ? (1.0f / row_l_new1) : 0.0f;;
         float factor2 = row_l_prev1 * __expf(row_m_prev1 - row_m_new1);
         float factor3 = __expf(row_m1 - row_m_new1);
 
-        float factor4 = 1 / row_l_new2;
+        float factor4 = (row_l_new2 != 0.0f) ? (1.0f / row_l_new2) : 0.0f;;
         float factor5 = row_l_prev2 * __expf(row_m_prev2 - row_m_new2);
         float factor6 = __expf(row_m2 - row_m_new2);
 
@@ -289,12 +304,13 @@ void forward_kernel(mykernelParamType param){
             for (int y = 0; y < 2; y++){
                 #pragma unroll
                 for(int x = 0; x < 2; x++){
-                    Oj[(O_row  )*param.d+O_col+y*8+x] = factor1 * ((factor2 * Oj[(O_row  )*param.d+O_col+y*8+x]) + (factor3 * c_frag[y][x  ]));
-                    Oj[(O_row+8)*param.d+O_col+y*8+x] = factor4 * ((factor5 * Oj[(O_row+8)*param.d+O_col+y*8+x]) + (factor6 * c_frag[y][x+2]));
+                    Oj[(O_row  )*param.d+O_col+y*8+x] = factor1 * (factor2 * Oj[(O_row  )*param.d+O_col+y*8+x] + factor3 * c_frag[y][x  ]);
+                    Oj[(O_row+8)*param.d+O_col+y*8+x] = factor4 * (factor5 * Oj[(O_row+8)*param.d+O_col+y*8+x] + factor6 * c_frag[y][x+2]);
                 }
             }
 
             __syncthreads();
+
         }
 
         // 更新最大值与和
@@ -312,11 +328,60 @@ void forward_kernel(mykernelParamType param){
         LDST128BITS(O[qo_offset_tx+k*4]) = LDST128BITS(Oj[qo_offset_tx+k*4]);
     }
 
+    // 将每行的最大值以及和写回到全局内存
+    int lm_offset = ((bz * gridDim.y + by) * param.N + (bx / param.split_num) * param.Br + warp_id * 16) * param.split_num + bx % param.split_num;
+    if(lane_id % 4 == 0){
+        param.L[lm_offset + (lane_id / 4) * param.split_num] = row_l_prev1;
+        param.M[lm_offset + (lane_id / 4) * param.split_num] = row_m_prev1;
+        param.L[lm_offset + (lane_id / 4 + 8) * param.split_num] = row_l_prev2;
+        param.M[lm_offset + (lane_id / 4 + 8) * param.split_num] = row_m_prev2;
+    }
+
     if (Is_dropout) {
-        const int state_idx = blockIdx.z * gridDim.y * gridDim.x + 
-                            blockIdx.y * gridDim.x + 
-                            blockIdx.x;
+        const int state_idx = bz * gridDim.y * gridDim.x + by * gridDim.x + bx;
         param.states[state_idx] = local_state;
     }
 }
+
+
+__global__
+void forward_kernel_splitkv_combine(mykernelParamType param){
+    const int tx = threadIdx.x;
+    // const int warp_id = tx / 32; const int lane_id = tx % 32;
+    const int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
+
+    int O_tmp_offset = (bz * gridDim.y + by) * param.d * param.N * param.split_num + bx * param.Br * param.d * param.split_num + tx * param.d;
+    int O_offset     = (bz * gridDim.y + by) * param.d * param.N + (bx * param.Br + tx) * param.d;
+    int lm_offset    = ((bz * gridDim.y + by) * param.N + bx * param.Br + tx) * param.split_num;
+
+    float* O_tmp = param.O_tmp + O_tmp_offset;
+    float* O     = param.O + O_offset;
+
+    float row_m = -INFINITY;
+    for(int i = 0; i < param.split_num; i++){
+        row_m = fmaxf(row_m, param.M[lm_offset+i]);
+    }
+
+    float row_l = 0;
+    for(int i = 0; i < param.split_num; i++){
+        row_l += __expf(param.M[lm_offset+i] - row_m) * param.L[lm_offset+i];
+    }
+
+    float O_result[32];
+    for(int i = 0; i < param.d / 32; i++){
+        memset(O_result, 0, sizeof(O_result));
+        for(int j = 0; j < param.split_num; j++){
+            float factor = (row_l != 0.0f) ? (1.0f / row_l) : 0.0f;
+            factor *= param.L[lm_offset+j] * __expf(param.M[lm_offset+j] - row_m);
+            for(int k = 0; k < 32; k++){
+                O_result[k] += factor * O_tmp[j*param.Br*param.d+i*32+k];
+            }
+        }
+        for(int k = 0; k < 32; k++){
+            O[i*32+k] = O_result[k];
+        }
+    }
+}
+
+
 #endif
