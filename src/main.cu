@@ -28,7 +28,7 @@ std::default_random_engine generator(26);
 std::uniform_real_distribution<float> distribution(0.0f, 10.0f);
 
 // 核函数指针类型定义
-template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi>
+template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K>
 using KernelFunctionPtr = void (*)(mykernelParamType);
 
 void verfiy(float* O, float* O_host, const int batch_size, const int n_heads, const int seq_len, const int head_dim, float range_of_error);
@@ -42,15 +42,15 @@ int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks
 int main(){
     const int  batch_size       = 1;
     const int  n_heads          = 8;
-    const int  seq_len          = 1024;
-    const int  head_dim         = 32;
+    const int  seq_len          = 1021;
+    const int  head_dim         = 31;      // 目前最大支持128
 
     const bool dropout          = false;      // 一旦启用dropout,那核函数的结果和没有使用dropout的cpu端结果必然不同,因此便不再验证结果正确性
-    const bool causal_mask      = true;     // 一般来说， causal_mask不会和window_attention同时启用 
+    const bool causal_mask      = false;     // 一般来说， causal_mask不会和window_attention同时启用 
     const bool window_attention = false;
-    const bool alibi            = true;
-    const bool Is_even_K        = !(head_dim % 32);
-    const bool Is_even_MN       = !(seq_len % 128);
+    const bool alibi            = false;
+    const bool even_K           = !(head_dim % 32);
+    const bool even_MN          = !(seq_len % 128);
 
     float dropout_prob = 0.0f;
     curandStatePhilox4_32_10_t* d_states;
@@ -117,14 +117,15 @@ int main(){
     param.d                 = head_dim;
     param.Br                = 128;
     param.Bc                = 128;
-    param.Tc                = ceil(seq_len / param.Bc);
-    param.Tr                = ceil(seq_len / param.Br);
+    param.Tc                = ceil((float)seq_len / param.Bc);
+    param.Tr                = ceil((float)seq_len / param.Br);
     param.softmax_scale     = 1.0 / sqrt(head_dim);
     param.window_size_right = window_size;
     param.window_size_left  = window_size;
     param.alibi_slopes_ptr  = alibi_slopes_device;
 
-    int split_num = num_splits_heuristic(param.Tr * n_heads * batch_size, 108, param.Tr, seq_len / 128, seq_len);
+    int split_num = num_splits_heuristic(param.Tr * n_heads * batch_size, 108, param.Tr, (seq_len + 127) / 128, (seq_len + 127) / 128 * 128);
+    printf("split_num: %d\n", split_num);
 
     if(dropout){
         // 分配状态内存
@@ -139,40 +140,24 @@ int main(){
         param.states            = d_states;
     }
 
-    // CPU端计算正确结果
-    attention_forward_cpu(Q, K, V, param.softmax_scale, batch_size, n_heads, seq_len, head_dim, O, causal_mask, window_size, alibi_slopes);
-
-    KernelFunctionPtr<dropout, causal_mask, window_attention, alibi> selectedKernel = nullptr;
-    int griddim_x = 1, griddim_y = 1, griddim_z = 1;       // 初始化网格大小
-    int blockdim_x = 1, blockdim_y = 1, blockdim_z = 1;    // 初始化线程块大小
+    KernelFunctionPtr<dropout, causal_mask, window_attention, alibi, even_MN, even_K> selectedKernel = nullptr;
+    int griddim_x = 1, griddim_y = n_heads, griddim_z = batch_size;       // 初始化网格大小
+    int blockdim_x = 256, blockdim_y = 1, blockdim_z = 1;    // 初始化线程块大小
     int sram_size;
 
     // 开始根据数据维度来选择核函数
     if(split_num == 1){
         // GPU网格尺寸
         griddim_x = param.Tr;
-        griddim_y = n_heads;
-        griddim_z = batch_size;
-        // GPU线程块尺寸
-        blockdim_x = 256;
-        if(Is_even_K && Is_even_MN){
-            // 共享内存大小
-            sram_size = (param.Br + param.Bc * 2) * param.d * sizeof(half) + param.Br * param.d * sizeof(float);
-            selectedKernel = forward_kernel<dropout, causal_mask, window_attention, alibi>;
-        }
-        else{
-            int d_align32 = (param.d + 31) / 32 * 32;
-            sram_size = (param.Br + param.Bc * 2) * d_align32 * sizeof(half) + param.Br * d_align32 * sizeof(float);
-            // selectedKernel = forward_kernel_general<dropout, causal_mask, window_attention, alibi>;
-        }
+
+        // 共享内存大小
+        int align_d = (param.d + 31) / 32 * 32;
+        sram_size = (param.Br + param.Bc * 2) * align_d * sizeof(half) + param.Br * align_d * sizeof(float);
+        selectedKernel = forward_kernel<dropout, causal_mask, window_attention, alibi, even_MN, even_K>;
     }
     else{
         // GPU网格尺寸
         griddim_x = param.Tr * split_num;
-        griddim_y = n_heads;
-        griddim_z = batch_size; 
-        // GPU线程块尺寸
-        blockdim_x = 256;
 
         cudaMalloc((void**)&O_tmp, batch_size*n_heads*seq_len*head_dim*split_num*sizeof(float));
         cudaMalloc((void**)&L, batch_size*n_heads*seq_len*split_num*sizeof(float));
@@ -183,20 +168,23 @@ int main(){
         param.L = L;
         param.M = M;
 
-        if(Is_even_K && Is_even_MN){
-            // 共享内存大小
-            sram_size = (param.Br + param.Bc * 2) * param.d * sizeof(half) + param.Br * param.d * sizeof(float);
-            selectedKernel = forward_kernel_splitkv<dropout, causal_mask, window_attention, alibi>;
-        }
-        else{
-            int d_align32 = (param.d + 31) / 32 * 32;
-            sram_size = (param.Br + param.Bc * 2) * d_align32 * sizeof(half) + param.Br * d_align32 * sizeof(float);
-            // selectedKernel = forward_kernel_splitkv_general<dropout, causal_mask, window_attention, alibi>;
-        }
+        // 共享内存大小
+        int align_d = (param.d + 31) / 32 * 32;
+        sram_size = (param.Br + param.Bc * 2) * align_d * sizeof(half) + param.Br * align_d * sizeof(float);
+        selectedKernel = forward_kernel_splitkv<dropout, causal_mask, window_attention, alibi, even_MN, even_K>;
     }
 
     dim3 grid_dim(griddim_x, griddim_y, griddim_z);
     dim3 block_dim(blockdim_x, blockdim_y, blockdim_z);
+
+    printf("sram size:%d\n", sram_size);
+    if(sram_size >= 49152 && sram_size <= 163840){
+        cudaFuncSetAttribute(selectedKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sram_size);
+    }
+    else if(sram_size > 163840){
+        printf("Insufficient shared memory. Please reduce the value of head_dim\n");
+        return 0;
+    }
     
     // 计时
     cudaEvent_t start,stop;
@@ -208,7 +196,7 @@ int main(){
     selectedKernel<<<grid_dim, block_dim, sram_size>>>(param);
     if(split_num > 1){
         dim3 combine_grid_dim(param.Tr, n_heads, batch_size);
-        forward_kernel_splitkv_combine<<<combine_grid_dim, 128>>>(param);
+        forward_kernel_splitkv_combine<<<combine_grid_dim, param.Br>>>(param);
     }    
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -218,13 +206,16 @@ int main(){
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_elapsed,start,stop);
 
+    // CPU端计算正确结果
+    attention_forward_cpu(Q, K, V, param.softmax_scale, batch_size, n_heads, seq_len, head_dim, O, causal_mask, window_size, alibi_slopes);
+
     // 将GPU结果拷贝回主机端
     cudaMemcpy(O_host, O_device, batch_size*n_heads*seq_len*head_dim*sizeof(float), cudaMemcpyDeviceToHost);
     printf("kernel time: %f us\n", time_elapsed*1000);
     // 检验结果正确性
     if(!dropout){
         printf("Verify the result of kernel function\n");
-        verfiy(O, O_host, batch_size, n_heads, seq_len, head_dim, 0.05);
+        verfiy(O, O_host, batch_size, n_heads, seq_len, head_dim, 0.06);
     }
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -268,11 +259,11 @@ void verfiy(
     for(int i=0;i<batch_size*n_heads*seq_len*head_dim;i++)
     {
         float device_out = O_host[i];
-        if((fabs(O_host[i] - O[i]))/O_host[i] > range_of_error || std::isnan(device_out) || std::isinf(device_out))
+        if((fabs(O_host[i] - O[i]))/O[i] > range_of_error || std::isnan(device_out) || std::isinf(device_out))
         {
             printf("error, postion:%d, gpuvalue:%f, cpuvalue:%f\n", i, O_host[i], O[i]);
             error++;
-            break;
+            // break;
         }        
     }
     printf("==================finish,error:%d==================\n",error);

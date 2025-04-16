@@ -10,18 +10,19 @@
 
 using namespace nvcuda;
 
-template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi>
+template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K>
 __global__
 void forward_kernel(mykernelParamType param){
     const int tx = threadIdx.x;
     const int warp_id = tx / 32; const int lane_id = tx % 32;
     const int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
 
+    int align_d = (param.d + 31) / 32 * 32;
     extern __shared__ char shared_mem[];
     half*  Qj = reinterpret_cast<half*>(shared_mem);
-    half*  Kj = reinterpret_cast<half*>(shared_mem + param.Br * param.d * sizeof(half));
-    half*  Vj = reinterpret_cast<half*>(shared_mem + (param.Br + param.Bc) * param.d * sizeof(half));
-    float* Oj = reinterpret_cast<float*>(shared_mem + (param.Br + param.Bc * 2) * param.d * sizeof(half));
+    half*  Kj = reinterpret_cast<half*>(shared_mem + param.Br * align_d * sizeof(half));
+    half*  Vj = reinterpret_cast<half*>(shared_mem + (param.Br + param.Bc) * align_d * sizeof(half));
+    float* Oj = reinterpret_cast<float*>(shared_mem + (param.Br + param.Bc * 2) * align_d * sizeof(half));
 
     float row_l_prev1 = 0;
     float row_l_prev2 = 0;
@@ -63,52 +64,47 @@ void forward_kernel(mykernelParamType param){
     float* O = param.O + qo_offset;
 
     // 初始化结果
-    for (int i = tx; i < param.Br * param.d; i += blockDim.x) {
+    for (int i = tx; i < param.Br * align_d; i += blockDim.x) {
         Oj[i] = 0.0f;
     }
     __syncthreads();
 
-    const int load_QO_num = param.Br * param.d / blockDim.x;    // 每个线程需要搬运多少个Q矩阵的元素
-    const int load_KV_num = param.Bc * param.d / blockDim.x;   // 每个线程需要搬运多少个K, V矩阵的元素
+    const int load_QO_num = param.Br * align_d / blockDim.x;    // 每个线程需要搬运多少个Q矩阵的元素
+    const int load_KV_num = param.Bc * align_d / blockDim.x;   // 每个线程需要搬运多少个K, V矩阵的元素
 
     size_t qo_offset_tx = tx * load_QO_num;    // 每个线程搬运数据相对的起始地址
     size_t kv_offset_tx = tx * load_KV_num;
 
     // 把Q从全局内存加载到共享内存
-    #pragma unroll
-    for (int k = 0; k < load_QO_num / 8; k++){
-        CP_ASYNC_CG(__cvta_generic_to_shared(&Qj[qo_offset_tx+k*8]), &Q[qo_offset_tx+k*8], 16);
-    }
-    
+    load_data(Qj, Q, align_d, param.d, qo_offset_tx, load_QO_num, param.Br, bx, param.N, Is_even_MN, Is_even_K);
     // 把K的第一块从全局内存加载到共享内存
-    #pragma unroll
-    for (int k = 0; k < load_KV_num / 8; k++){
-        CP_ASYNC_CG(__cvta_generic_to_shared(&Kj[kv_offset_tx+k*8]), &K[kv_offset_tx+k*8], 16);
-    }
-
-    CP_ASYNC_COMMIT_GROUP();
+    load_data(Kj, K, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, n_block_min, param.N, Is_even_MN, Is_even_K);
 
     for (int iter = n_block_min; iter < n_block_max; iter++){
         // 确保Q,K均加载到共享内存
-        CP_ASYNC_WAIT_ALL();
-        // 异步加载V到共享内存
-        for (int k = 0; k < load_KV_num / 8; k++){
-            CP_ASYNC_CG(__cvta_generic_to_shared(&Vj[kv_offset_tx+k*8]), &V[kv_offset_tx+k*8], 16);
+        if(Is_even_MN && Is_even_K){
+            CP_ASYNC_WAIT_ALL();
         }
-        CP_ASYNC_COMMIT_GROUP();
+        else{
+            __syncthreads();
+        }
+        // 异步加载V到共享内存
+        load_data(Vj, V, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, iter, param.N, Is_even_MN, Is_even_K);
+        
         // K, V指针指向下一块K, V要读取的数据的地址
         K += tile_size;
         V += tile_size;
 
         memset(c_frag, 0, sizeof(c_frag));
+        __syncthreads();
         // S = Q * K.T
         #pragma unroll
-        for (int x = 0; x < param.d / 16; x++){
-            uint32_t aOffsetPtr = __cvta_generic_to_shared(&Qj[(warp_id*16+lane_id%16)*param.d+x*16+(lane_id/16)*8]);
+        for (int x = 0; x < align_d / 16; x++){
+            uint32_t aOffsetPtr = __cvta_generic_to_shared(&Qj[(warp_id*16+lane_id%16)*align_d+x*16+(lane_id/16)*8]);
             LDMATRIX_X4(a_frag[0], a_frag[1], a_frag[2], a_frag[3], aOffsetPtr);
             #pragma unroll
             for (int y = 0; y < param.Bc / 16; y++){
-                uint32_t bOffsetPtr = __cvta_generic_to_shared(&Kj[(y*16+lane_id%16)*param.d+x*16+(lane_id/16)*8]);
+                uint32_t bOffsetPtr = __cvta_generic_to_shared(&Kj[(y*16+lane_id%16)*align_d+x*16+(lane_id/16)*8]);
                 LDMATRIX_X4(b_frag[0], b_frag[2], b_frag[1], b_frag[3], bOffsetPtr);
 
                 HMMA16816F32(c_frag[y][0], c_frag[y][1], c_frag[y][4], c_frag[y][5], a_frag[0], a_frag[1], a_frag[2], a_frag[3], \
@@ -158,12 +154,8 @@ void forward_kernel(mykernelParamType param){
         CP_ASYNC_WAIT_ALL();
         // 异步加载下一次迭代需要的K到共享内存
         if (iter < n_block_max - 1){
-            #pragma unroll
-            for (int k = 0; k < load_KV_num / 8; k++){
-                CP_ASYNC_CG(__cvta_generic_to_shared(&Kj[kv_offset_tx+k*8]), &K[kv_offset_tx+k*8], 16);
-            }
+            load_data(Kj, K, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, iter + 1, param.N, Is_even_MN, Is_even_K);
         }
-        CP_ASYNC_COMMIT_GROUP();
 
         // 先计算alibi(可选),然后求每个线程每行的最大值
         float row_m1 = -INFINITY;
@@ -264,14 +256,14 @@ void forward_kernel(mykernelParamType param){
 
         // S = S * V
         #pragma unroll 
-        for (int i = 0; i < param.d / 16; i++){
+        for (int i = 0; i < align_d / 16; i++){
             memset(c_frag, 0, sizeof(c_frag));
             #pragma unroll
             for (int j = 0; j < param.Bc / 16; j++){
                 uint32_t aOffsetPtr;
                 #pragma unroll
                 for (int x = 0; x < 2; x++){
-                    aOffsetPtr = __cvta_generic_to_shared(&Vj[(j*16+lane_id%16)*param.d+i*16+x*8]);
+                    aOffsetPtr = __cvta_generic_to_shared(&Vj[(j*16+lane_id%16)*align_d+i*16+x*8]);
                     LDMATRIX_X2_T(a_frag[x*2], a_frag[x*2+1], aOffsetPtr);
                     __syncwarp();
 
@@ -289,8 +281,8 @@ void forward_kernel(mykernelParamType param){
             for (int y = 0; y < 2; y++){
                 #pragma unroll
                 for(int x = 0; x < 2; x++){
-                    Oj[(O_row  )*param.d+O_col+y*8+x] = factor1 * ((factor2 * Oj[(O_row  )*param.d+O_col+y*8+x]) + (factor3 * c_frag[y][x  ]));
-                    Oj[(O_row+8)*param.d+O_col+y*8+x] = factor4 * ((factor5 * Oj[(O_row+8)*param.d+O_col+y*8+x]) + (factor6 * c_frag[y][x+2]));
+                    Oj[(O_row  )*align_d+O_col+y*8+x] = factor1 * ((factor2 * Oj[(O_row  )*align_d+O_col+y*8+x]) + (factor3 * c_frag[y][x  ]));
+                    Oj[(O_row+8)*align_d+O_col+y*8+x] = factor4 * ((factor5 * Oj[(O_row+8)*align_d+O_col+y*8+x]) + (factor6 * c_frag[y][x+2]));
                 }
             }
 
@@ -304,14 +296,9 @@ void forward_kernel(mykernelParamType param){
         row_m_prev2 = row_m_new2;
     }
 
-    __syncthreads();
-
     // 把Q从共享内存写到全局内存
-    #pragma unroll
-    for (int k = 0; k < load_QO_num / 4; k++){
-        LDST128BITS(O[qo_offset_tx+k*4]) = LDST128BITS(Oj[qo_offset_tx+k*4]);
-    }
-
+    load_data(O, Oj, param.d, align_d, qo_offset_tx, load_QO_num, param.Br, bx, param.N, Is_even_MN, Is_even_K);
+    
     if (Is_dropout) {
         const int state_idx = blockIdx.z * gridDim.y * gridDim.x + 
                             blockIdx.y * gridDim.x + 

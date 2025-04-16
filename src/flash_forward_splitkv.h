@@ -11,18 +11,19 @@
 
 using namespace nvcuda;
 
-template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi>
+template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K>
 __global__
 void forward_kernel_splitkv(mykernelParamType param){
     const int tx = threadIdx.x;
     const int warp_id = tx / 32; const int lane_id = tx % 32;
     const int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
 
+    int align_d = (param.d + 31) / 32 * 32;
     extern __shared__ char shared_mem[];
     half*  Qj = reinterpret_cast<half*>(shared_mem);
-    half*  Kj = reinterpret_cast<half*>(shared_mem + param.Br * param.d * sizeof(half));
-    half*  Vj = reinterpret_cast<half*>(shared_mem + (param.Br + param.Bc) * param.d * sizeof(half));
-    float* Oj = reinterpret_cast<float*>(shared_mem + (param.Br + param.Bc * 2) * param.d * sizeof(half));
+    half*  Kj = reinterpret_cast<half*>(shared_mem + param.Br * align_d * sizeof(half));
+    half*  Vj = reinterpret_cast<half*>(shared_mem + (param.Br + param.Bc) * align_d * sizeof(half));
+    float* Oj = reinterpret_cast<float*>(shared_mem + (param.Br + param.Bc * 2) * align_d * sizeof(half));
 
     float row_l_prev1 = 0;
     float row_l_prev2 = 0;
@@ -60,8 +61,15 @@ void forward_kernel_splitkv(mykernelParamType param){
     int kv_offset = (bz * gridDim.y + by)* param.N * param.d + param.d * param.Bc * n_block_min;
     // // 计算Q的全局内存地址
     int q_offset = (bz * gridDim.y + by)* param.N * param.d + param.d * param.Br * (bx / param.split_num);
-    int o_offset = (bz * gridDim.y + by)* param.N * param.d * param.split_num + param.d * param.Br * bx;
-
+    int o_offset;
+    if (Is_even_MN || bx / param.split_num != param.Tr - 1){
+        o_offset = (bz * gridDim.y + by) * param.N * param.d * param.split_num + param.d * param.Br * bx;
+    }
+    else{
+        o_offset = (bz * gridDim.y + by) * param.N * param.d * param.split_num + param.d * param.Br * bx \
+                    - (param.Tr * param.Br - param.N) * (bx % param.split_num) * param.d;
+    }
+    
     half*  Q = param.Q + q_offset;
     half*  K = param.K + kv_offset;
     half*  V = param.V + kv_offset;
@@ -69,54 +77,49 @@ void forward_kernel_splitkv(mykernelParamType param){
 
     // 初始化结果
     #pragma unroll
-    for (int i = tx; i < param.Br * param.d; i += blockDim.x) {
+    for (int i = tx; i < param.Br * align_d; i += blockDim.x) {
         Oj[i] = 0.0f;
     }
     __syncthreads();
 
-    const int load_QO_num = param.Br * param.d / blockDim.x;    // 每个线程需要搬运多少个Q矩阵的元素
-    const int load_KV_num = param.Bc * param.d / blockDim.x;   // 每个线程需要搬运多少个K, V矩阵的元素
+    const int load_QO_num = param.Br * align_d / blockDim.x;   // 每个线程需要搬运多少个Q矩阵的元素
+    const int load_KV_num = param.Bc * align_d / blockDim.x;   // 每个线程需要搬运多少个K, V矩阵的元素
 
     size_t qo_offset_tx = tx * load_QO_num;    // 每个线程搬运数据相对的起始地址
     size_t kv_offset_tx = tx * load_KV_num;
 
     if (n_block_min < n_block_max){
         // 把Q从全局内存加载到共享内存
-        #pragma unroll
-        for (int k = 0; k < load_QO_num / 8; k++){
-            CP_ASYNC_CG(__cvta_generic_to_shared(&Qj[qo_offset_tx+k*8]), &Q[qo_offset_tx+k*8], 16);
-        }
-    
+        load_data(Qj, Q, align_d, param.d, qo_offset_tx, load_QO_num, param.Br, bx / param.split_num, param.N, Is_even_MN, Is_even_K);
         // 把K的第一块从全局内存加载到共享内存
-        #pragma unroll
-        for (int k = 0; k < load_KV_num / 8; k++){
-            CP_ASYNC_CG(__cvta_generic_to_shared(&Kj[kv_offset_tx+k*8]), &K[kv_offset_tx+k*8], 16);
-        }
-
-        CP_ASYNC_COMMIT_GROUP();
+        load_data(Kj, K, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, n_block_min, param.N, Is_even_MN, Is_even_K);
     }
     
     for (int iter = n_block_min; iter < n_block_max; iter++){
         // 确保Q,K均加载到共享内存
-        CP_ASYNC_WAIT_ALL();
-        // 异步加载V到共享内存
-        for (int k = 0; k < load_KV_num / 8; k++){
-            CP_ASYNC_CG(__cvta_generic_to_shared(&Vj[kv_offset_tx+k*8]), &V[kv_offset_tx+k*8], 16);
+        if(Is_even_MN && Is_even_K){
+            CP_ASYNC_WAIT_ALL();
         }
-        CP_ASYNC_COMMIT_GROUP();
+        else{
+            __syncthreads();
+        }
+        // 异步加载V到共享内存
+        load_data(Vj, V, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, iter, param.N, Is_even_MN, Is_even_K);
+
         // K, V指针指向下一块K, V要读取的数据的地址
         K += tile_size;
         V += tile_size;
 
         memset(c_frag, 0, sizeof(c_frag));
+        __syncthreads();
         // S = Q * K.T
         #pragma unroll
-        for (int x = 0; x < param.d / 16; x++){
-            uint32_t aOffsetPtr = __cvta_generic_to_shared(&Qj[(warp_id*16+lane_id%16)*param.d+x*16+(lane_id/16)*8]);
+        for (int x = 0; x < align_d / 16; x++){
+            uint32_t aOffsetPtr = __cvta_generic_to_shared(&Qj[(warp_id*16+lane_id%16)*align_d+x*16+(lane_id/16)*8]);
             LDMATRIX_X4(a_frag[0], a_frag[1], a_frag[2], a_frag[3], aOffsetPtr);
             #pragma unroll
             for (int y = 0; y < param.Bc / 16; y++){
-                uint32_t bOffsetPtr = __cvta_generic_to_shared(&Kj[(y*16+lane_id%16)*param.d+x*16+(lane_id/16)*8]);
+                uint32_t bOffsetPtr = __cvta_generic_to_shared(&Kj[(y*16+lane_id%16)*align_d+x*16+(lane_id/16)*8]);
                 LDMATRIX_X4(b_frag[0], b_frag[2], b_frag[1], b_frag[3], bOffsetPtr);
 
                 HMMA16816F32(c_frag[y][0], c_frag[y][1], c_frag[y][4], c_frag[y][5], a_frag[0], a_frag[1], a_frag[2], a_frag[3], \
@@ -166,12 +169,8 @@ void forward_kernel_splitkv(mykernelParamType param){
         CP_ASYNC_WAIT_ALL();
         // 异步加载下一次迭代需要的K到共享内存
         if (iter < n_block_max - 1){
-            #pragma unroll
-            for (int k = 0; k < load_KV_num / 8; k++){
-                CP_ASYNC_CG(__cvta_generic_to_shared(&Kj[kv_offset_tx+k*8]), &K[kv_offset_tx+k*8], 16);
-            }
+            load_data(Kj, K, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, iter + 1, param.N, Is_even_MN, Is_even_K);
         }
-        CP_ASYNC_COMMIT_GROUP();
 
         // 先计算alibi(可选),然后求每个线程每行的最大值
         float row_m1 = -INFINITY;
@@ -194,8 +193,6 @@ void forward_kernel_splitkv(mykernelParamType param){
                 if (c_frag[i][j + 4] > row_m2)    row_m2 = c_frag[i][j + 4];
             }
         }
-
-        __syncthreads();
 
         // 规约出最大值
         #pragma unroll
@@ -220,8 +217,6 @@ void forward_kernel_splitkv(mykernelParamType param){
             }
         }
 
-         __syncthreads();
-
         // 规约求和
         #pragma unroll
         for (int i = 3; i >= 1; i /= 2){
@@ -231,9 +226,6 @@ void forward_kernel_splitkv(mykernelParamType param){
             row_l_other = __shfl_xor_sync(0xffffffff, row_l2, i, 32);
             row_l2 += row_l_other;
         }
-
-         __syncthreads();
-
 
         // 计算最大值与和
         float row_m_new1 = fmaxf(row_m1, row_m_prev1);
@@ -279,16 +271,15 @@ void forward_kernel_splitkv(mykernelParamType param){
 
         // S = S * V
         #pragma unroll 
-        for (int i = 0; i < param.d / 16; i++){
+        for (int i = 0; i < align_d / 16; i++){
             memset(c_frag, 0, sizeof(c_frag));
             #pragma unroll
             for (int j = 0; j < param.Bc / 16; j++){
                 uint32_t aOffsetPtr;
                 #pragma unroll
                 for (int x = 0; x < 2; x++){
-                    aOffsetPtr = __cvta_generic_to_shared(&Vj[(j*16+lane_id%16)*param.d+i*16+x*8]);
+                    aOffsetPtr = __cvta_generic_to_shared(&Vj[(j*16+lane_id%16)*align_d+i*16+x*8]);
                     LDMATRIX_X2_T(a_frag[x*2], a_frag[x*2+1], aOffsetPtr);
-                    __syncwarp();
 
                     HMMA16816F32(c_frag[x][0], c_frag[x][1], c_frag[x][2], c_frag[x][3],  \
                                  d_frag[j][0], d_frag[j][2], d_frag[j][1], d_frag[j][3],  \
@@ -304,13 +295,12 @@ void forward_kernel_splitkv(mykernelParamType param){
             for (int y = 0; y < 2; y++){
                 #pragma unroll
                 for(int x = 0; x < 2; x++){
-                    Oj[(O_row  )*param.d+O_col+y*8+x] = factor1 * (factor2 * Oj[(O_row  )*param.d+O_col+y*8+x] + factor3 * c_frag[y][x  ]);
-                    Oj[(O_row+8)*param.d+O_col+y*8+x] = factor4 * (factor5 * Oj[(O_row+8)*param.d+O_col+y*8+x] + factor6 * c_frag[y][x+2]);
+                    Oj[(O_row  )*align_d+O_col+y*8+x] = factor1 * (factor2 * Oj[(O_row  )*align_d+O_col+y*8+x] + factor3 * c_frag[y][x  ]);
+                    Oj[(O_row+8)*align_d+O_col+y*8+x] = factor4 * (factor5 * Oj[(O_row+8)*align_d+O_col+y*8+x] + factor6 * c_frag[y][x+2]);
                 }
             }
 
             __syncthreads();
-
         }
 
         // 更新最大值与和
@@ -320,21 +310,31 @@ void forward_kernel_splitkv(mykernelParamType param){
         row_m_prev2 = row_m_new2;
     }
 
-    __syncthreads();
-
     // 把Q从共享内存写到全局内存
-    #pragma unroll
-    for (int k = 0; k < load_QO_num / 4; k++){
-        LDST128BITS(O[qo_offset_tx+k*4]) = LDST128BITS(Oj[qo_offset_tx+k*4]);
-    }
+    load_data(O, Oj, param.d, align_d, qo_offset_tx, load_QO_num, param.Br, bx / param.split_num, param.N, Is_even_MN, Is_even_K);
 
     // 将每行的最大值以及和写回到全局内存
-    int lm_offset = ((bz * gridDim.y + by) * param.N + (bx / param.split_num) * param.Br + warp_id * 16) * param.split_num + bx % param.split_num;
     if(lane_id % 4 == 0){
-        param.L[lm_offset + (lane_id / 4) * param.split_num] = row_l_prev1;
-        param.M[lm_offset + (lane_id / 4) * param.split_num] = row_m_prev1;
-        param.L[lm_offset + (lane_id / 4 + 8) * param.split_num] = row_l_prev2;
-        param.M[lm_offset + (lane_id / 4 + 8) * param.split_num] = row_m_prev2;
+        if(Is_even_MN || bx / param.split_num < param.Tr - 1){
+            int lm_offset = ((bz * gridDim.y + by) * param.N + (bx / param.split_num) * param.Br + warp_id * 16 + lane_id / 4) * param.split_num \
+                             + bx % param.split_num;
+            param.L[lm_offset] = row_l_prev1;
+            param.M[lm_offset] = row_m_prev1;
+            param.L[lm_offset+8*param.split_num] = row_l_prev2;
+            param.M[lm_offset+8*param.split_num] = row_m_prev2;
+        }
+        else{
+            int lm_offset = ((bz * gridDim.y + by) * param.N) * param.split_num + bx % param.split_num;
+            int row = (bx / param.split_num) * param.Br + warp_id * 16 + lane_id / 4;
+            if(row < param.N){
+                param.L[lm_offset+row*param.split_num] = row_l_prev1;
+                param.M[lm_offset+row*param.split_num] = row_m_prev1;
+            }
+            if(row + 8 < param.N){
+                param.L[lm_offset+(row+8)*param.split_num] = row_l_prev2;
+                param.M[lm_offset+(row+8)*param.split_num] = row_m_prev2;
+            }
+        }   
     }
 
     if (Is_dropout) {
@@ -347,7 +347,6 @@ void forward_kernel_splitkv(mykernelParamType param){
 __global__
 void forward_kernel_splitkv_combine(mykernelParamType param){
     const int tx = threadIdx.x;
-    // const int warp_id = tx / 32; const int lane_id = tx % 32;
     const int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
 
     int O_tmp_offset = (bz * gridDim.y + by) * param.d * param.N * param.split_num + bx * param.Br * param.d * param.split_num + tx * param.d;
@@ -358,27 +357,43 @@ void forward_kernel_splitkv_combine(mykernelParamType param){
     float* O     = param.O + O_offset;
 
     float row_m = -INFINITY;
+    #pragma unroll
     for(int i = 0; i < param.split_num; i++){
         row_m = fmaxf(row_m, param.M[lm_offset+i]);
     }
 
     float row_l = 0;
+    #pragma unroll
     for(int i = 0; i < param.split_num; i++){
         row_l += __expf(param.M[lm_offset+i] - row_m) * param.L[lm_offset+i];
     }
 
-    float O_result[32];
-    for(int i = 0; i < param.d / 32; i++){
-        memset(O_result, 0, sizeof(O_result));
-        for(int j = 0; j < param.split_num; j++){
-            float factor = (row_l != 0.0f) ? (1.0f / row_l) : 0.0f;
-            factor *= param.L[lm_offset+j] * __expf(param.M[lm_offset+j] - row_m);
-            for(int k = 0; k < 32; k++){
-                O_result[k] += factor * O_tmp[j*param.Br*param.d+i*32+k];
+    int row_spacing;
+    if(param.N % param.Br == 0 || bx < param.Tr - 1){
+        row_spacing = param.Br;
+    }
+    else{
+        row_spacing = param.N - (param.Tr - 1) * param.Br;
+    }
+    
+    if(bx < param.Tr - 1 || (bx == param.Tr - 1 && tx < param.N - (param.Tr - 1) * param.Br)){
+        float O_result[32];
+        #pragma unroll
+        for(int i = 0; i < (param.d + 31) / 32; i++){
+            memset(O_result, 0, sizeof(O_result));
+            #pragma unroll
+            for(int j = 0; j < param.split_num; j++){
+                float factor = (row_l != 0.0f) ? (1.0f / row_l) : 0.0f;
+                factor *= param.L[lm_offset+j] * __expf(param.M[lm_offset+j] - row_m);
+                #pragma unroll
+                for(int k = 0; k + 32 * i < param.d; k++){
+                    O_result[k] += factor * O_tmp[j*row_spacing*param.d+i*32+k];
+                }
             }
-        }
-        for(int k = 0; k < 32; k++){
-            O[i*32+k] = O_result[k];
+            #pragma unroll
+            for(int k = 0; k + 32 * i < param.d; k++){
+                O[i*32+k] = O_result[k];
+            }
         }
     }
 }
