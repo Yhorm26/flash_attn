@@ -24,9 +24,9 @@ typedef struct mykernelParamType
     half*    K;
     half*    V;
     float*   O;
-    float*   O_tmp;  // splitkvÖĞOµÄÁÙÊ±¿Õ¼ä
-    float*   L;      // splitkvÖĞ¸÷¸ö·Ö¶ÎÃ¿ĞĞµÄºÍ
-    float*   M;      // splitkvÖĞ¸÷¸ö·Ö¶ÎÃ¿ĞĞµÄ×î´óÖµ
+    float*   O_tmp;  // splitkvï¿½ï¿½Oï¿½ï¿½ï¿½ï¿½Ê±ï¿½Õ¼ï¿½
+    float*   L;      // splitkvï¿½Ğ¸ï¿½ï¿½ï¿½ï¿½Ö¶ï¿½Ã¿ï¿½ĞµÄºï¿½
+    float*   M;      // splitkvï¿½Ğ¸ï¿½ï¿½ï¿½ï¿½Ö¶ï¿½Ã¿ï¿½Ğµï¿½ï¿½ï¿½ï¿½Öµ
     int      N;
     int      d;
     int      Br;
@@ -35,15 +35,15 @@ typedef struct mykernelParamType
     int      Tc;
     float    softmax_scale;
     float    dropout_prob;
-    unsigned long long seed;      // Ëæ»úÖÖ×Ó
-    curandStatePhilox4_32_10_t* states; // CURAND×´Ì¬Ö¸Õë
+    unsigned long long seed;      // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+    curandStatePhilox4_32_10_t* states; // CURAND×´Ì¬Ö¸ï¿½ï¿½
     int      window_size_left;
     int      window_size_right;
     float*   alibi_slopes_ptr;
     int      split_num;
 }mykernelParamType;
 
-
+// ç”¨äºæ‰“åŒ…æ•°æ®
 __device__ inline uint32_t pack_float_to_uint32(float num1, float num2) {
     half a = __float2half(num1);
     half b = __float2half(num2);
@@ -52,5 +52,97 @@ __device__ inline uint32_t pack_float_to_uint32(float num1, float num2) {
     uint16_t b_bits = __half_as_ushort(b);
 
     return (static_cast<uint32_t>(b_bits) << 16u) | a_bits;
+}
+
+// ç”¨äºä»å…¨å±€å†…å­˜åŠ è½½Q, K, V
+__device__ inline void load_data(half* dst, half* src, int dst_row_length, int src_row_length, int offset, int count, int Br, int bx, int seq_len, bool Is_even_MN, bool Is_even_K){
+    if (Is_even_MN && Is_even_K){
+        #pragma unroll
+        for (int i = 0; i < count / 8; i++){
+            CP_ASYNC_CG(__cvta_generic_to_shared(&dst[offset+i*8]), &src[offset+i*8], 16);
+        }
+        CP_ASYNC_COMMIT_GROUP();
+    }
+    else if (Is_even_K && !Is_even_MN){
+        int row = offset / dst_row_length;
+        if(row + Br * bx < seq_len){
+            #pragma unroll
+            for (int i = 0; i < count / 8; i++){
+                CP_ASYNC_CG(__cvta_generic_to_shared(&dst[offset+i*8]), &src[offset+i*8], 16);
+            }
+            CP_ASYNC_COMMIT_GROUP();
+        }
+        else{
+            #pragma unroll
+            for(int i = 0; i < count; i++){
+                dst[offset+i] = 0.0f;
+            }
+        }
+    }
+    else if (Is_even_MN && !Is_even_K){
+        int row = offset / dst_row_length;
+        #pragma unroll
+        for(int i = 0; i < count; i++){
+            int col = (offset + i) % dst_row_length;
+            if(col < src_row_length){
+                dst[offset+i] = src[row * src_row_length + col];
+            }
+            else{
+                dst[offset+i] = 0.0f;
+            }
+        }
+    }
+    else{
+        #pragma unroll
+        for(int i = 0; i < count; i++){
+            int row = (offset + i) / dst_row_length;
+            int col = (offset + i) % dst_row_length;
+            if(row + Br * bx < seq_len && col < src_row_length){
+                dst[offset+i] = src[row * src_row_length + col];
+            }
+            else{
+                dst[offset+i] = 0.0f;
+            }
+        }
+    }
+}   
+
+// ç”¨äºæŠŠOçŸ©é˜µä»å…±äº«å†…å­˜åŠ è½½åˆ°å…¨å±€å†…å­˜
+__device__ inline void load_data(float* dst, float* src, int dst_row_length, int src_row_length, int offset, int count, int Br, int bx, int seq_len, bool Is_even_MN, bool Is_even_K){
+    if (Is_even_MN && Is_even_K){
+        #pragma unroll
+        for (int i = 0; i < count / 4; i++){
+            LDST128BITS(dst[offset+i*4]) = LDST128BITS(src[offset+i*4]);
+        }
+    }
+    else if (Is_even_K && !Is_even_MN){
+        int row = offset / src_row_length;
+        if(row + Br * bx < seq_len){
+            #pragma unroll
+            for (int i = 0; i < count / 4; i++){
+                LDST128BITS(dst[offset+i*4]) = LDST128BITS(src[offset+i*4]);
+            }
+        }
+    }
+    else if (Is_even_MN && !Is_even_K){
+        int row = offset / src_row_length;
+        #pragma unroll
+        for(int i = 0; i < count; i++){
+            int col = (offset + i) % dst_row_length;
+            if(col < dst_row_length){
+                dst[row * dst_row_length + col] = src[row * src_row_length + col];
+            }
+        }
+    }
+    else{
+        #pragma unroll
+        for(int i = 0; i < count; i++){
+            int row = (offset + i) / src_row_length;
+            int col = (offset + i) % src_row_length;
+            if(row + Br * bx < seq_len && col < dst_row_length){
+                dst[row * dst_row_length + col] = src[row * src_row_length + col];
+            }
+        }
+    }
 }
 #endif // UTILS_H
