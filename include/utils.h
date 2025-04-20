@@ -24,9 +24,9 @@ typedef struct mykernelParamType
     half*    K;
     half*    V;
     float*   O;
-    float*   O_tmp;  // splitkv��O����ʱ�ռ�
-    float*   L;      // splitkv�и����ֶ�ÿ�еĺ�
-    float*   M;      // splitkv�и����ֶ�ÿ�е����ֵ
+    float*   O_tmp;  
+    float*   L;      
+    float*   M; 
     int      N;
     int      d;
     int      Br;
