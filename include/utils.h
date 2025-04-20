@@ -35,8 +35,8 @@ typedef struct mykernelParamType
     int      Tc;
     float    softmax_scale;
     float    dropout_prob;
-    unsigned long long seed;      // �������
-    curandStatePhilox4_32_10_t* states; // CURAND״ָ̬��
+    unsigned long long seed;
+    curandStatePhilox4_32_10_t* states; 
     int      window_size_left;
     int      window_size_right;
     float*   alibi_slopes_ptr;
