@@ -85,14 +85,14 @@ void forward_kernel_splitkv(mykernelParamType param){
     const int load_QO_num = param.Br * align_d / blockDim.x;   // 每个线程需要搬运多少个Q矩阵的元素
     const int load_KV_num = param.Bc * align_d / blockDim.x;   // 每个线程需要搬运多少个K, V矩阵的元素
 
-    size_t qo_offset_tx = tx * load_QO_num;    // 每个线程搬运数据相对的起始地址
-    size_t kv_offset_tx = tx * load_KV_num;
-
     if (n_block_min < n_block_max){
         // 把Q从全局内存加载到共享内存
-        load_data(Qj, Q, align_d, param.d, qo_offset_tx, load_QO_num, param.Br, bx / param.split_num, param.N, Is_even_MN, Is_even_K);
+        load_data(Qj, Q, align_d, param.d, load_QO_num, param.Br, bx / param.split_num, blockDim.x, tx, param.N, Is_even_MN, Is_even_K);
         // 把K的第一块从全局内存加载到共享内存
-        load_data(Kj, K, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, n_block_min, param.N, Is_even_MN, Is_even_K);
+        load_data(Kj, K, align_d, param.d, load_KV_num, param.Bc, n_block_min, blockDim.x, tx, param.N, Is_even_MN, Is_even_K);
+        if(Is_even_K){
+            CP_ASYNC_COMMIT_GROUP();
+        }
     }
     
     for (int iter = n_block_min; iter < n_block_max; iter++){
@@ -104,7 +104,7 @@ void forward_kernel_splitkv(mykernelParamType param){
             __syncthreads();
         }
         // 异步加载V到共享内存
-        load_data(Vj, V, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, iter, param.N, Is_even_MN, Is_even_K);
+        load_data(Vj, V, align_d, param.d, load_KV_num, param.Bc, iter, blockDim.x, tx, param.N, Is_even_MN, Is_even_K);
 
         // K, V指针指向下一块K, V要读取的数据的地址
         K += tile_size;
@@ -169,7 +169,7 @@ void forward_kernel_splitkv(mykernelParamType param){
         CP_ASYNC_WAIT_ALL();
         // 异步加载下一次迭代需要的K到共享内存
         if (iter < n_block_max - 1){
-            load_data(Kj, K, align_d, param.d, kv_offset_tx, load_KV_num, param.Bc, iter + 1, param.N, Is_even_MN, Is_even_K);
+            load_data(Kj, K, align_d, param.d, load_KV_num, param.Bc, iter + 1, blockDim.x, tx, param.N, Is_even_MN, Is_even_K);
         }
 
         // 先计算alibi(可选),然后求每个线程每行的最大值
@@ -311,7 +311,7 @@ void forward_kernel_splitkv(mykernelParamType param){
     }
 
     // 把Q从共享内存写到全局内存
-    load_data(O, Oj, param.d, align_d, qo_offset_tx, load_QO_num, param.Br, bx / param.split_num, param.N, Is_even_MN, Is_even_K);
+    load_data(O, Oj, param.d, align_d, load_QO_num, param.Br, bx / param.split_num, blockDim.x, tx, param.N, Is_even_MN, Is_even_K);
 
     // 将每行的最大值以及和写回到全局内存
     if(lane_id % 4 == 0){

@@ -24,9 +24,6 @@
         } \
     } while (0)
 
-std::default_random_engine generator(26);
-std::uniform_real_distribution<float> distribution(0.0f, 10.0f);
-
 // 核函数指针类型定义
 template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K>
 using KernelFunctionPtr = void (*)(mykernelParamType);
@@ -37,7 +34,6 @@ void attention_forward_cpu(float* Q, float* K, float* V, float softmax_scale, co
     const int head_dim, float* output, const bool use_causal_mask = false, int window_size = -1, float* alibi_slopes = nullptr);
 
 int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits, int seq_len);
-
 
 int main(){
     const int  batch_size       = 1;
@@ -92,6 +88,8 @@ int main(){
 
     float* O_tmp; float* L; float* M;
 
+    std::default_random_engine generator(26);
+    std::uniform_real_distribution<float> distribution(0.0f, 10.0f);
     for(int i = 0; i < batch_size*n_heads*seq_len*head_dim; i++)
     {
         Q[i] = distribution(generator);
@@ -185,7 +183,14 @@ int main(){
         printf("Insufficient shared memory. Please reduce the value of head_dim\n");
         return 0;
     }
-    
+
+    dim3 combine_grid_dim(param.Tr, n_heads, batch_size);
+    // 预热
+    selectedKernel<<<grid_dim, block_dim, sram_size>>>(param);
+    if(split_num > 1){
+        forward_kernel_splitkv_combine<<<combine_grid_dim, param.Br>>>(param);
+    } 
+
     // 计时
     cudaEvent_t start,stop;
     cudaEventCreate(&start);
@@ -193,11 +198,12 @@ int main(){
     cudaEventRecord(start,0);
     float time_elapsed=0.0;
     // 核函数启动
-    selectedKernel<<<grid_dim, block_dim, sram_size>>>(param);
-    if(split_num > 1){
-        dim3 combine_grid_dim(param.Tr, n_heads, batch_size);
-        forward_kernel_splitkv_combine<<<combine_grid_dim, param.Br>>>(param);
-    }    
+    for(int i = 0; i < 1000;i++){
+        selectedKernel<<<grid_dim, block_dim, sram_size>>>(param);
+        if(split_num > 1){
+            forward_kernel_splitkv_combine<<<combine_grid_dim, param.Br>>>(param);
+        } 
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     
@@ -211,7 +217,7 @@ int main(){
 
     // 将GPU结果拷贝回主机端
     cudaMemcpy(O_host, O_device, batch_size*n_heads*seq_len*head_dim*sizeof(float), cudaMemcpyDeviceToHost);
-    printf("kernel time: %f us\n", time_elapsed*1000);
+    printf("kernel time: %f us\n", time_elapsed*1000/1000);
     // 检验结果正确性
     if(!dropout){
         printf("Verify the result of kernel function\n");
