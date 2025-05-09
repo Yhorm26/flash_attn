@@ -20,13 +20,13 @@
 
 typedef struct mykernelParamType
 {
-    half*    Q; 
-    half*    K;
-    half*    V;
-    float*   O;
-    float*   O_tmp;  
-    float*   L;      
-    float*   M; 
+    half*  __restrict__ Q; 
+    half*  __restrict__ K;
+    half*  __restrict__ V;
+    float* __restrict__ O;
+    float* __restrict__ O_tmp;  
+    float* __restrict__ L;      
+    float* __restrict__ M; 
     int      N;
     int      d;
     int      Br;
@@ -55,93 +55,108 @@ __device__ inline uint32_t pack_float_to_uint32(float num1, float num2) {
 }
 
 // 用于从全局内存加载Q, K, V
-__device__ inline void load_data(half* dst, half* src, int dst_row_length, int src_row_length, int offset, int count, int Br, int bx, int seq_len, bool Is_even_MN, bool Is_even_K){
+__device__ inline void load_data(half* dst, half* src, int dst_row_length, int src_row_length, int count, int Br, int bx, int bdx, int tx, int seq_len, bool Is_even_MN, bool Is_even_K){
     if (Is_even_MN && Is_even_K){
+        int offset = tx * 8;
         #pragma unroll
         for (int i = 0; i < count / 8; i++){
-            CP_ASYNC_CG(__cvta_generic_to_shared(&dst[offset+i*8]), &src[offset+i*8], 16);
+            CP_ASYNC_CG(__cvta_generic_to_shared(&dst[offset]), &src[offset], 16);
+            offset += bdx * 8;
         }
-        CP_ASYNC_COMMIT_GROUP();
     }
     else if (Is_even_K && !Is_even_MN){
-        int row = offset / dst_row_length;
-        if(row + Br * bx < seq_len){
-            #pragma unroll
-            for (int i = 0; i < count / 8; i++){
-                CP_ASYNC_CG(__cvta_generic_to_shared(&dst[offset+i*8]), &src[offset+i*8], 16);
-            }
-            CP_ASYNC_COMMIT_GROUP();
-        }
-        else{
-            #pragma unroll
-            for(int i = 0; i < count; i++){
-                dst[offset+i] = 0.0f;
-            }
-        }
-    }
-    else if (Is_even_MN && !Is_even_K){
-        int row = offset / dst_row_length;
+        int offset = tx * 8;
         #pragma unroll
-        for(int i = 0; i < count; i++){
-            int col = (offset + i) % dst_row_length;
-            if(col < src_row_length){
-                dst[offset+i] = src[row * src_row_length + col];
+        for (int i = 0; i < count / 8; i++){
+            int row = offset / dst_row_length;
+            if(row + Br * bx < seq_len){
+                CP_ASYNC_CG(__cvta_generic_to_shared(&dst[offset]), &src[offset], 16);
             }
             else{
-                dst[offset+i] = 0.0f;
+                #pragma unroll
+                for(int i = 0; i < 8; i++){
+                    dst[offset+i] = 0.0f;
+                }
             }
+            offset += bdx * 8;
+        }
+        
+    }
+    else if (Is_even_MN && !Is_even_K){
+        int offset = tx;
+        #pragma unroll
+        for(int i = 0; i < count; i++){
+            int row = offset / dst_row_length;
+            int col = offset % dst_row_length;
+            if(col < src_row_length){
+                dst[offset] = src[row * src_row_length + col];
+            }
+            else{
+                dst[offset] = 0.0f;
+            }
+            offset += bdx;
         }
     }
     else{
+        int offset = tx;
         #pragma unroll
         for(int i = 0; i < count; i++){
-            int row = (offset + i) / dst_row_length;
-            int col = (offset + i) % dst_row_length;
+            int row = offset / dst_row_length;
+            int col = offset % dst_row_length;
             if(row + Br * bx < seq_len && col < src_row_length){
-                dst[offset+i] = src[row * src_row_length + col];
+                dst[offset] = src[row * src_row_length + col];
             }
             else{
-                dst[offset+i] = 0.0f;
+                dst[offset] = 0.0f;
             }
+            offset += bdx;
         }
     }
 }   
 
 // 用于把O矩阵从共享内存加载到全局内存
-__device__ inline void load_data(float* dst, float* src, int dst_row_length, int src_row_length, int offset, int count, int Br, int bx, int seq_len, bool Is_even_MN, bool Is_even_K){
+__device__ inline void load_data(float* dst, float* src, int dst_row_length, int src_row_length, int count, int Br, int bx, int bdx, int tx, int seq_len, bool Is_even_MN, bool Is_even_K){
     if (Is_even_MN && Is_even_K){
+        int offset = tx * 4;
         #pragma unroll
         for (int i = 0; i < count / 4; i++){
-            LDST128BITS(dst[offset+i*4]) = LDST128BITS(src[offset+i*4]);
+            LDST128BITS(dst[offset]) = LDST128BITS(src[offset]);
+            offset += bdx * 4;
         }
     }
     else if (Is_even_K && !Is_even_MN){
-        int row = offset / src_row_length;
-        if(row + Br * bx < seq_len){
-            #pragma unroll
-            for (int i = 0; i < count / 4; i++){
-                LDST128BITS(dst[offset+i*4]) = LDST128BITS(src[offset+i*4]);
+        int offset = tx * 4;
+        #pragma unroll
+        for (int i = 0; i < count / 4; i++){
+            int row = offset / src_row_length;
+            if(row + Br * bx < seq_len){
+                LDST128BITS(dst[offset]) = LDST128BITS(src[offset]);
             }
+            offset += bdx * 4;
         }
     }
     else if (Is_even_MN && !Is_even_K){
-        int row = offset / src_row_length;
+        int offset = tx;
         #pragma unroll
         for(int i = 0; i < count; i++){
-            int col = (offset + i) % dst_row_length;
+            int row = offset / src_row_length;
+            int col = offset % dst_row_length;
             if(col < dst_row_length){
                 dst[row * dst_row_length + col] = src[row * src_row_length + col];
             }
+            offset += bdx;
         }
     }
     else{
+        int offset = tx;
         #pragma unroll
         for(int i = 0; i < count; i++){
-            int row = (offset + i) / src_row_length;
-            int col = (offset + i) % src_row_length;
+            int row = offset / src_row_length;
+            int col = offset % src_row_length;
             if(row + Br * bx < seq_len && col < dst_row_length){
                 dst[row * dst_row_length + col] = src[row * src_row_length + col];
             }
+            offset += bdx;
         }
     }
 }
