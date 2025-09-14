@@ -5,62 +5,39 @@
 #include <random>
 #include <vector>
 #include <algorithm>
-#include <sys/time.h>
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 #include <cuda_runtime.h>
 #include "utils.h"
 #include "init_curand_states.h"
 #include "flash_forward.h"
-#include "flash_forward_splitkv.h"
 
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
+void verify(half* O, half* O_host, const int batch_size, const int n_heads, const int seq_len, const int head_dim, float range_of_error);
 
-// 核函数指针类型定义
-template<bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K>
-using KernelFunctionPtr = void (*)(mykernelParamType);
-
-void verfiy(float* O, float* O_host, const int batch_size, const int n_heads, const int seq_len, const int head_dim, float range_of_error);
-
-void attention_forward_cpu(float* Q, float* K, float* V, float softmax_scale, const int batch_size, const int n_heads, const int seq_len, 
-    const int head_dim, float* output, const bool use_causal_mask = false, int window_size = -1, float* alibi_slopes = nullptr);
-
-int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits, int seq_len);
+void attention_forward_cpu(const half* Q, const half* K, const half* V, float softmax_scale, const int batch_size, const int n_heads, const int seq_len, 
+    const int head_dim, half* output, const bool use_causal_mask = false, int window_size = -1, const float* alibi_slopes = nullptr);
 
 int main(){
-    const int  batch_size       = 1;
-    const int  n_heads          = 8;
-    const int  seq_len          = 1021;
-    const int  head_dim         = 31;      // 目前最大支持128
+    int  batch_size       = 1;
+    int  n_heads          = 8;
+    int  seq_len          = 1024;
+    int  head_dim         = 64;
 
-    const bool dropout          = false;      // 一旦启用dropout,那核函数的结果和没有使用dropout的cpu端结果必然不同,因此便不再验证结果正确性
-    const bool causal_mask      = false;     // 一般来说， causal_mask不会和window_attention同时启用 
-    const bool window_attention = false;
-    const bool alibi            = false;
-    const bool even_K           = !(head_dim % 32);
-    const bool even_MN          = !(seq_len % 128);
+    bool dropout          = false;
+    bool causal_mask      = false;
+    bool window_attention = false;
+    bool alibi            = false;
+    bool even_K           = !(head_dim % 32);
+    bool even_MN          = !(seq_len % 128);
+    float dropout_prob    = 0.0f;
+    int window_size       = -1;
 
-    float dropout_prob = 0.0f;
     curandStatePhilox4_32_10_t* d_states;
-    if(dropout){
-        dropout_prob = 0.1f;
-    }
 
-    int window_size = -1;
-    if(window_attention){
-        window_size = 128;
-    }
     float *alibi_slopes = nullptr;
     float *alibi_slopes_device = nullptr;
-    if(alibi){
+    if (alibi) {
         alibi_slopes = (float*)malloc(n_heads*sizeof(float));
         for (int i = 0; i < n_heads; i++){
             alibi_slopes[i] = -std::pow(2, -8.0 / n_heads * (i + 1));
@@ -69,22 +46,21 @@ int main(){
         cudaMemcpy(alibi_slopes_device, alibi_slopes, n_heads*sizeof(float),cudaMemcpyHostToDevice);
     }
       
-    float *Q      = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
-    float *K      = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
-    float *V      = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
-    float *O      = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
-    float *O_host = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
+    float *Q = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
+    float *K = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
+    float *V = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
 
     half *Q_half = (half*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(half));
     half *K_half = (half*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(half));
     half *V_half = (half*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(half));
+    half *O_half = (half*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(half));
+    half *O_host = (half*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(half));
 
-    float *O_device;
-    half  *Q_device_half,*K_device_half,*V_device_half;
-    cudaMalloc((void**)&O_device, batch_size*n_heads*seq_len*head_dim*sizeof(float));
-    cudaMalloc((void**)&Q_device_half, batch_size*n_heads*seq_len*head_dim*sizeof(half));
-    cudaMalloc((void**)&K_device_half, batch_size*n_heads*seq_len*head_dim*sizeof(half));
-    cudaMalloc((void**)&V_device_half, batch_size*n_heads*seq_len*head_dim*sizeof(half));
+    half  *Q_device,*K_device,*V_device, *O_device;
+    cudaMalloc((void**)&Q_device, batch_size*n_heads*seq_len*head_dim*sizeof(half));
+    cudaMalloc((void**)&K_device, batch_size*n_heads*seq_len*head_dim*sizeof(half));
+    cudaMalloc((void**)&V_device, batch_size*n_heads*seq_len*head_dim*sizeof(half));
+    cudaMalloc((void**)&O_device, batch_size*n_heads*seq_len*head_dim*sizeof(half));
 
     float* O_tmp; float* L; float* M;
 
@@ -95,142 +71,45 @@ int main(){
         Q[i] = distribution(generator);
         K[i] = distribution(generator);
         V[i] = distribution(generator);
-        O[i] = 0.0f;
 
         Q_half[i] = __float2half(Q[i]);
         K_half[i] = __float2half(K[i]);
         V_half[i] = __float2half(V[i]);
+        O_half[i] = 0;
     }
 
-    cudaMemcpy(Q_device_half, Q_half, batch_size*n_heads*seq_len*head_dim*sizeof(half),cudaMemcpyHostToDevice);
-    cudaMemcpy(K_device_half, K_half, batch_size*n_heads*seq_len*head_dim*sizeof(half),cudaMemcpyHostToDevice);
-    cudaMemcpy(V_device_half, V_half, batch_size*n_heads*seq_len*head_dim*sizeof(half),cudaMemcpyHostToDevice);
-    
-    mykernelParamType param;
-    param.Q                 = Q_device_half;
-    param.K                 = K_device_half;
-    param.V                 = V_device_half;
-    param.O                 = O_device;
-    param.N                 = seq_len;
-    param.d                 = head_dim;
-    param.Br                = 128;
-    param.Bc                = 128;
-    param.Tc                = ceil((float)seq_len / param.Bc);
-    param.Tr                = ceil((float)seq_len / param.Br);
-    param.softmax_scale     = 1.0 / sqrt(head_dim);
-    param.window_size_right = window_size;
-    param.window_size_left  = window_size;
-    param.alibi_slopes_ptr  = alibi_slopes_device;
+    cudaMemcpy(Q_device, Q_half, batch_size*n_heads*seq_len*head_dim*sizeof(half),cudaMemcpyHostToDevice);
+    cudaMemcpy(K_device, K_half, batch_size*n_heads*seq_len*head_dim*sizeof(half),cudaMemcpyHostToDevice);
+    cudaMemcpy(V_device, V_half, batch_size*n_heads*seq_len*head_dim*sizeof(half),cudaMemcpyHostToDevice);
 
-    int split_num = num_splits_heuristic(param.Tr * n_heads * batch_size, 108, param.Tr, (seq_len + 127) / 128, (seq_len + 127) / 128 * 128);
-    printf("split_num: %d\n", split_num);
-
-    if(dropout){
+    if (dropout) {
         // 分配状态内存
-        int num_blocks = param.Tr * n_heads * batch_size * split_num * 256;
+        int num_blocks = ceil((float)seq_len / 128) * n_heads * batch_size * 256;
         cudaMalloc(&d_states, num_blocks * sizeof(curandStatePhilox4_32_10_t));
 
         // 初始化状态
         dim3 grid((num_blocks + 255)/256, 1, 1);
         int seed = 48;
         init_curand_states<<<grid, 256>>>(d_states, seed, num_blocks);
-        param.dropout_prob      = dropout_prob;
-        param.states            = d_states;
     }
 
-    KernelFunctionPtr<dropout, causal_mask, window_attention, alibi, even_MN, even_K> selectedKernel = nullptr;
-    int griddim_x = 1, griddim_y = n_heads, griddim_z = batch_size;       // 初始化网格大小
-    int blockdim_x = 256, blockdim_y = 1, blockdim_z = 1;    // 初始化线程块大小
-    int sram_size;
+    // GPU端计算结果
+    run_flash_attention(batch_size, n_heads, seq_len, head_dim, Q_device, K_device, V_device, O_device);
 
-    // 开始根据数据维度来选择核函数
-    if(split_num == 1){
-        // GPU网格尺寸
-        griddim_x = param.Tr;
-
-        // 共享内存大小
-        int align_d = (param.d + 31) / 32 * 32;
-        sram_size = (param.Br + param.Bc * 2) * align_d * sizeof(half) + param.Br * align_d * sizeof(float);
-        selectedKernel = forward_kernel<dropout, causal_mask, window_attention, alibi, even_MN, even_K>;
-    }
-    else{
-        // GPU网格尺寸
-        griddim_x = param.Tr * split_num;
-
-        cudaMalloc((void**)&O_tmp, batch_size*n_heads*seq_len*head_dim*split_num*sizeof(float));
-        cudaMalloc((void**)&L, batch_size*n_heads*seq_len*split_num*sizeof(float));
-        cudaMalloc((void**)&M, batch_size*n_heads*seq_len*split_num*sizeof(float));
-
-        param.O_tmp = O_tmp;
-        param.split_num = split_num;
-        param.L = L;
-        param.M = M;
-
-        // 共享内存大小
-        int align_d = (param.d + 31) / 32 * 32;
-        sram_size = (param.Br + param.Bc * 2) * align_d * sizeof(half) + param.Br * align_d * sizeof(float);
-        selectedKernel = forward_kernel_splitkv<dropout, causal_mask, window_attention, alibi, even_MN, even_K>;
-    }
-
-    dim3 grid_dim(griddim_x, griddim_y, griddim_z);
-    dim3 block_dim(blockdim_x, blockdim_y, blockdim_z);
-
-    printf("sram size:%d\n", sram_size);
-    if(sram_size >= 49152 && sram_size <= 163840){
-        cudaFuncSetAttribute(selectedKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sram_size);
-    }
-    else if(sram_size > 163840){
-        printf("Insufficient shared memory. Please reduce the value of head_dim\n");
-        return 0;
-    }
-
-    dim3 combine_grid_dim(param.Tr, n_heads, batch_size);
-    // 预热
-    selectedKernel<<<grid_dim, block_dim, sram_size>>>(param);
-    if(split_num > 1){
-        forward_kernel_splitkv_combine<<<combine_grid_dim, param.Br>>>(param);
-    } 
-
-    // 计时
-    cudaEvent_t start,stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start,0);
-    float time_elapsed=0.0;
-    // 核函数启动
-    for(int i = 0; i < 1000;i++){
-        selectedKernel<<<grid_dim, block_dim, sram_size>>>(param);
-        if(split_num > 1){
-            forward_kernel_splitkv_combine<<<combine_grid_dim, param.Br>>>(param);
-        } 
-    }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // 计时结束
-    cudaEventRecord(stop,0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time_elapsed,start,stop);
-
-    // CPU端计算正确结果
-    attention_forward_cpu(Q, K, V, param.softmax_scale, batch_size, n_heads, seq_len, head_dim, O, causal_mask, window_size, alibi_slopes);
-
-    // 将GPU结果拷贝回主机端
-    cudaMemcpy(O_host, O_device, batch_size*n_heads*seq_len*head_dim*sizeof(float), cudaMemcpyDeviceToHost);
-    printf("kernel time: %f us\n", time_elapsed*1000/1000);
+    cudaMemcpy(O_host, O_device, batch_size*n_heads*seq_len*head_dim*sizeof(half), cudaMemcpyDeviceToHost);
     // 检验结果正确性
     if(!dropout){
         printf("Verify the result of kernel function\n");
-        verfiy(O, O_host, batch_size, n_heads, seq_len, head_dim, 0.06);
+        // CPU端计算正确结果
+        attention_forward_cpu(Q_half, K_half, V_half, 1.0 / sqrt(head_dim), batch_size, n_heads, seq_len, head_dim, O_half, causal_mask, window_size, alibi_slopes);
+        verify(O_half, O_host, batch_size, n_heads, seq_len, head_dim, 0.06);
     }
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 
     // 释放显存
     cudaFree(O_device);
-    cudaFree(Q_device_half);
-    cudaFree(K_device_half);
-    cudaFree(V_device_half);
+    cudaFree(Q_device);
+    cudaFree(K_device);
+    cudaFree(V_device);
     cudaFree(d_states);
     
     cudaFree(L);
@@ -241,7 +120,7 @@ int main(){
     free(Q);
     free(K);
     free(V);
-    free(O);
+    free(O_half);
     free(O_host);
     free(Q_half);
     free(K_half);
@@ -250,10 +129,9 @@ int main(){
     return 0;
 }
 
-
-void verfiy(
-    float* O, 
-    float* O_host,
+void verify(
+    half* O, 
+    half* O_host,
     const int batch_size,
     const int n_heads,
     const int seq_len,
@@ -261,34 +139,34 @@ void verfiy(
     float range_of_error)
 {
     int error=0;
-    printf("===================start verfiy===================\n");
+    printf("===================start verify===================\n");
     for(int i=0;i<batch_size*n_heads*seq_len*head_dim;i++)
     {
-        float device_out = O_host[i];
-        if((fabs(O_host[i] - O[i]))/O[i] > range_of_error || std::isnan(device_out) || std::isinf(device_out))
+        float device_out = __float2half(O_host[i]);
+        float host_out = __float2half(O[i]);
+        if((fabs(device_out - host_out))/host_out > range_of_error || std::isnan(device_out) || std::isinf(device_out))
         {
-            printf("error, postion:%d, gpuvalue:%f, cpuvalue:%f\n", i, O_host[i], O[i]);
+            printf("error, postion:%d, gpuvalue:%f, cpuvalue:%f\n", i, device_out, host_out);
             error++;
-            // break;
+            break;
         }        
     }
     printf("==================finish,error:%d==================\n",error);
 }
 
-
 void attention_forward_cpu(
-    float* Q, 
-    float* K, 
-    float* V, 
+    const half* Q,
+    const half* K,
+    const half* V,
     float softmax_scale,
     const int batch_size,
     const int n_heads,
-    const int seq_len, 
-    const int head_dim, 
-    float* output,
+    const int seq_len,
+    const int head_dim,
+    half* output,
     const bool use_causal_mask,
     int window_size,
-    float* alibi_slopes)
+    const float* alibi_slopes)
 {
     const int head_size = seq_len * head_dim;
     const int seq_sq = seq_len * seq_len;
@@ -300,17 +178,17 @@ void attention_forward_cpu(
         for (int h = 0; h < n_heads; ++h) {
             // 获取当前head的指针偏移量
             const int base_offset = b * n_heads * head_size + h * head_size;
-            const float* Q_ptr = Q + base_offset;
-            const float* K_ptr = K + base_offset;
-            const float* V_ptr = V + base_offset;
-            float* out_ptr = output + base_offset;
+            const half* Q_ptr = Q + base_offset;
+            const half* K_ptr = K + base_offset;
+            const half* V_ptr = V + base_offset;
+            half* out_ptr = output + base_offset;
 
             // 1. 计算QK^T
             for (int i = 0; i < seq_len; ++i) {
                 for (int j = 0; j < seq_len; ++j) {
                     float sum = 0.0f;
                     for (int k = 0; k < head_dim; ++k) {
-                        sum += Q_ptr[i * head_dim + k] * K_ptr[j * head_dim + k];
+                        sum += __half2float(Q_ptr[i * head_dim + k] * K_ptr[j * head_dim + k]);
                     }
                     scores[i * seq_len + j] = sum * softmax_scale;
                 }
@@ -376,47 +254,13 @@ void attention_forward_cpu(
                 for (int k = 0; k < head_dim; ++k) {
                     float sum = 0.0f;
                     for (int j = 0; j < seq_len; ++j) {
-                        sum += scores[i * seq_len + j] * V_ptr[j * head_dim + k];
+                        sum += __half2float(__float2half(scores[i * seq_len + j]) * V_ptr[j * head_dim + k]);
                     }
-                    out_ptr[i * head_dim + k] = sum;
+                    out_ptr[i * head_dim + k] = __float2half(sum);
                 }
             }
         }
     }
 
     delete[] scores;
-}
-
-
-int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits, int seq_len) {
-    if (batch_nheads_mblocks >= 4.0f * num_SMs) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    float max_efficiency = 0.f;
-    std::vector<float> efficiency;
-    efficiency.reserve(max_splits);
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-    auto is_split_eligible = [&ceildiv, &num_n_blocks, &seq_len](int num_splits) {
-        return (num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1)) && (seq_len % (128 * num_splits) == 0);
-    };
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) {
-            efficiency.push_back(0.f);
-        } else {
-            // 计算拆分后的平均efficiency
-            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
-            float eff = n_waves / ceil(n_waves);
-            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
-            if (eff > max_efficiency) { max_efficiency = eff; }
-            efficiency.push_back(eff);
-        }
-    }
-    // 选择满足85%利用率最小的拆分
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) { continue; }
-        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
-            return num_splits;
-        }
-    }
-    return 1;
 }
