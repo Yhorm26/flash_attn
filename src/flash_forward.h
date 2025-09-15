@@ -197,7 +197,7 @@ void __launch_bounds__(NUM_THREADS) forward_kernel(const __grid_constant__ CUten
             wait(fullQ, q);
             q ^= 1;
 
-            const float alibi_slope = !Has_alibi ? 0.0f : param.alibi_slopes_ptr[seq_id];
+            const float alibi_slope = !Has_alibi ? 0.0f : param.alibi_slopes_ptr[seq_id%param.N];
             
             for (int iter = n_block_min; iter < n_block_max; iter++, qidx++) {
                 if (qidx == QSIZE) {qidx = 0; p ^= 1; }
@@ -236,11 +236,7 @@ void __launch_bounds__(NUM_THREADS) forward_kernel(const __grid_constant__ CUten
                     arrive(&emptyK[qidx]);
                 }
 
-                apply_mask<Is_causal, Is_local, Has_alibi, num_consumers, Br, Bc>(c_frag, 
-                    blockId * Br + warp_id * Br / num_consumers / NUMWARPPERGROUP,
-                    iter * Bc, tid, param.window_size_left, alibi_slope
-                );
-
+                #pragma unroll
                 for (int i = 0; i < Br/num_consumers/NUMWARPPERGROUP/MMA_M; i++) {
                     #pragma unroll
                     for (int j = 0; j < Bc/MMA_N; j++) {
@@ -250,6 +246,11 @@ void __launch_bounds__(NUM_THREADS) forward_kernel(const __grid_constant__ CUten
                         }
                     }
                 }
+
+                apply_mask<Is_causal, Is_local, Has_alibi, num_consumers, Br, Bc>(c_frag, 
+                    (blockId % param.Tr) * Br + warp_id * Br / num_consumers / NUMWARPPERGROUP,
+                    iter * Bc, tid, param.window_size_left, alibi_slope
+                );
 
                 apply_softmax<num_consumers, Br, Bc>(c_frag, row_m_prev, row_m, row_l, row_l_prev);
 
@@ -333,6 +334,8 @@ void __launch_bounds__(NUM_THREADS) forward_kernel(const __grid_constant__ CUten
                     o_frag[i][j][3] /= row_l[i][1];
                 }
             }
+
+            asm volatile("cp.async.bulk.wait_group 0;");
 
             // 将 O 加载至共享内存
             half* block_sO = sO + warp_group_role * Br / num_consumers * d;

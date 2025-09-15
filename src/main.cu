@@ -19,17 +19,15 @@ void attention_forward_cpu(const half* Q, const half* K, const half* V, float so
     const int head_dim, half* output, const bool use_causal_mask = false, int window_size = -1, const float* alibi_slopes = nullptr);
 
 int main(){
-    int  batch_size       = 1;
+    int  batch_size       = 2;
     int  n_heads          = 8;
-    int  seq_len          = 1024;
+    int  seq_len          = 2048;
     int  head_dim         = 64;
 
     bool dropout          = false;
-    bool causal_mask      = false;
+    bool causal_mask      = true;
     bool window_attention = false;
-    bool alibi            = false;
-    bool even_K           = !(head_dim % 32);
-    bool even_MN          = !(seq_len % 128);
+    bool alibi            = true;
     float dropout_prob    = 0.0f;
     int window_size       = -1;
 
@@ -44,6 +42,10 @@ int main(){
         }
         cudaMalloc((void**)&alibi_slopes_device, n_heads*sizeof(float));
         cudaMemcpy(alibi_slopes_device, alibi_slopes, n_heads*sizeof(float),cudaMemcpyHostToDevice);
+    }
+
+    if (window_attention) {
+        window_size = 128;
     }
       
     float *Q = (float*)malloc(batch_size*n_heads*seq_len*head_dim*sizeof(float));
@@ -94,7 +96,7 @@ int main(){
     }
 
     // GPU端计算结果
-    run_flash_attention(batch_size, n_heads, seq_len, head_dim, Q_device, K_device, V_device, O_device);
+    run_flash_attention(batch_size, n_heads, seq_len, head_dim, Q_device, K_device, V_device, O_device, nullptr, nullptr, dropout, causal_mask, window_attention, alibi, window_size, alibi_slopes_device, dropout_prob);
 
     cudaMemcpy(O_host, O_device, batch_size*n_heads*seq_len*head_dim*sizeof(half), cudaMemcpyDeviceToHost);
     // 检验结果正确性
